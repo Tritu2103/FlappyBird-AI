@@ -1,0 +1,327 @@
+import asyncio
+import sys
+
+import pygame
+from pygame.locals import K_ESCAPE, K_SPACE, K_UP, KEYDOWN, QUIT
+
+import numpy as np
+
+from .entities import (
+    Background,
+    Floor,
+    GameOver,
+    Pipes,
+    Player,
+    PlayerMode,
+    Score,
+    WelcomeMessage,
+)
+from .utils import GameConfig, Images, Sounds, Window
+
+
+class Flappy:
+    def __init__(self, headless: bool = False):
+        """
+        Args:
+            headless: Nếu True, không khởi tạo pygame display (nhanh hơn)
+        """
+        pygame.init()
+        
+        if not headless:
+            pygame.display.set_caption("Flappy Bird")
+            window = Window(288, 512)
+            screen = pygame.display.set_mode((window.width, window.height))
+        else:
+            # Headless mode: không cần screen
+            window = Window(288, 512)
+            screen = pygame.Surface((window.width, window.height))  # Fake surface
+        
+        images = Images()
+
+        self.config = GameConfig(
+            screen=screen,
+            clock=pygame.time.Clock(),
+            fps=30,  # Sẽ bị ignore trong headless mode
+            window=window,
+            images=images,
+            sounds=Sounds(),
+        )
+        self.headless = headless
+    
+    async def start(self, agent=None):
+        while True:
+            self.background = Background(self.config)
+            self.floor = Floor(self.config)
+            self.player = Player(self.config)
+            self.welcome_message = WelcomeMessage(self.config)
+            self.game_over_message = GameOver(self.config)
+            self.pipes = Pipes(self.config)
+            self.score = Score(self.config)
+            await self.splash()
+            await self.play(agent=agent)
+            await self.game_over()
+
+    async def splash(self):
+        """Shows welcome splash screen animation of flappy bird"""
+
+        self.player.set_mode(PlayerMode.SHM)
+
+        while True:
+            for event in pygame.event.get():
+                self.check_quit_event(event)
+                if self.is_tap_event(event):
+                    return
+
+            self.background.tick()
+            self.floor.tick()
+            self.player.tick()
+            self.welcome_message.tick()
+
+            pygame.display.update()
+            await asyncio.sleep(0)
+            self.config.tick()
+
+    def check_quit_event(self, event):
+        if event.type == QUIT or (
+            event.type == KEYDOWN and event.key == K_ESCAPE
+        ):
+            pygame.quit()
+            sys.exit()
+
+    def is_tap_event(self, event):
+        m_left, _, _ = pygame.mouse.get_pressed()
+        space_or_up = event.type == KEYDOWN and (
+            event.key == K_SPACE or event.key == K_UP
+        )
+        screen_tap = event.type == pygame.FINGERDOWN
+        return m_left or space_or_up or screen_tap
+
+    async def play_training_episode(self, agent, config, render=False):
+        """
+        Chạy một episode để train DQN agent.
+        
+        Args:
+            agent: DQN agent
+            config: DQN config
+            render: Có render game hay không (False = train nhanh hơn)
+            
+        Returns:
+            (total_reward, score, steps)
+        """
+        # Initialize game entities (giống như trong start())
+        self.background = Background(self.config)
+        self.floor = Floor(self.config)
+        self.player = Player(self.config)
+        self.pipes = Pipes(self.config)
+        self.score = Score(self.config)
+        
+        self.score.reset()
+        self.player.set_mode(PlayerMode.NORMAL)
+        
+        total_reward = 0
+        steps = 0
+        prev_score = 0
+        
+        # Get initial state
+        state_dict = self.player.get_detailed_state(self.pipes, self.floor)
+        state = np.array([state_dict["dx"], state_dict["dy"], state_dict["v"]], dtype=np.float32)
+        
+        while steps < config.max_steps_per_episode:
+            # Select action
+            action = agent.select_action(state, training=True)
+            
+            # Execute action
+            if action == 1:
+                self.player.flap()
+            
+            # Update game state
+            self.background.tick()
+            self.floor.tick()
+            self.pipes.tick()
+            self.player.tick()
+            
+            # Check collision (done)
+            done = self.player.collided(self.pipes, self.floor)
+            
+            # Check score
+            for pipe in self.pipes.upper:
+                if self.player.crossed(pipe):
+                    self.score.add()
+            
+            # Calculate reward
+            reward = config.reward_alive
+            if self.score.score > prev_score:
+                reward += config.reward_pass_pipe
+                prev_score = self.score.score
+            if done:
+                reward = config.reward_death
+            
+            # Get next state
+            next_state_dict = self.player.get_detailed_state(self.pipes, self.floor)
+            next_state = np.array([
+                next_state_dict["dx"],
+                next_state_dict["dy"],
+                next_state_dict["v"]
+            ], dtype=np.float32)
+            
+            # Store transition
+            agent.store_transition(state, action, reward, next_state, done)
+            
+            # Train agent
+            if steps % config.train_freq == 0:
+                loss = agent.train_step()
+            
+            # Update state
+            state = next_state
+            total_reward += reward
+            steps += 1
+            
+            # Render chỉ khi cần
+            if render:
+                self.score.tick()
+                pygame.display.update()
+                await asyncio.sleep(0)
+                self.config.tick()
+            
+            if done:
+                break
+        
+        return total_reward, self.score.score, steps
+
+    async def play(self, agent=None):
+        """Play một episode (evaluation mode)."""
+        self.score.reset()
+        self.player.set_mode(PlayerMode.NORMAL)
+
+        while True:
+            if self.player.collided(self.pipes, self.floor):
+                return self.score.score
+            
+            state_dict = self.player.get_detailed_state(self.pipes, self.floor)
+            dx = state_dict["dx"]
+            dy = state_dict["dy"]
+            v = state_dict["v"]
+
+            for i, pipe in enumerate(self.pipes.upper):
+                if self.player.crossed(pipe):
+                    self.score.add()
+
+            for event in pygame.event.get():
+                self.check_quit_event(event)
+                if agent is None and self.is_tap_event(event):
+                    self.player.flap()
+
+            if agent is not None:
+                state = np.array([dx, dy, v], dtype=np.float32)
+                action = agent.select_action(state, training=False)  # No exploration
+                if action == 1:
+                    self.player.flap()
+
+            self.background.tick()
+            self.floor.tick()
+            self.pipes.tick()
+            self.score.tick()
+            self.player.tick()
+
+            pygame.display.update()
+            await asyncio.sleep(0)
+            self.config.tick()
+
+    async def play_no_render(self, agent=None):
+        """
+        Play một episode KHÔNG render (siêu nhanh).
+        Dùng cho training/evaluation với tốc độ cao.
+        """
+        self.score.reset()
+        self.player.set_mode(PlayerMode.NORMAL)
+
+        while True:
+            if self.player.collided(self.pipes, self.floor):
+                return self.score.score
+            
+            state_dict = self.player.get_detailed_state(self.pipes, self.floor)
+            dx = state_dict["dx"]
+            dy = state_dict["dy"]
+            v = state_dict["v"]
+
+            # Check score
+            for i, pipe in enumerate(self.pipes.upper):
+                if self.player.crossed(pipe):
+                    self.score.add()
+
+            # Agent action (không check keyboard events)
+            if agent is not None:
+                state = np.array([dx, dy, v], dtype=np.float32)
+                action = agent.select_action(state, training=False)
+                if action == 1:
+                    self.player.flap()
+
+            # Update game state (KHÔNG render)
+            self.background.tick()
+            self.floor.tick()
+            self.pipes.tick()
+            self.player.tick()
+            
+            # BỎ QUA: pygame.display.update(), asyncio.sleep(), config.tick()
+            # Chỉ cần logic update
+
+    async def play_fast(self, agent=None):
+        """
+        Play episode với tốc độ tối đa (không render, không sleep).
+        NHANH NHẤT - dùng cho evaluation hàng loạt.
+        """
+        self.score.reset()
+        self.player.set_mode(PlayerMode.NORMAL)
+
+        while True:
+            # Check collision
+            if self.player.collided(self.pipes, self.floor):
+                return self.score.score
+            
+            # Get state
+            state_dict = self.player.get_detailed_state(self.pipes, self.floor)
+            state = np.array([state_dict["dx"], state_dict["dy"], state_dict["v"]], dtype=np.float32)
+
+            # Check score
+            for pipe in self.pipes.upper:
+                if self.player.crossed(pipe):
+                    self.score.add()
+
+            # Agent action
+            if agent is not None:
+                action = agent.select_action(state, training=False)
+                if action == 1:
+                    self.player.flap()
+
+            # Update (KHÔNG render, KHÔNG sleep)
+            self.background.tick()
+            self.floor.tick()
+            self.pipes.tick()
+            self.player.tick()
+            
+            # Không cần: pygame.display.update(), await asyncio.sleep(0), self.config.tick()
+    
+    async def game_over(self):
+        """crashes the player down and shows gameover image"""
+
+        self.player.set_mode(PlayerMode.CRASH)
+        self.pipes.stop()
+        self.floor.stop()
+
+        while True:
+            for event in pygame.event.get():
+                self.check_quit_event(event)
+                if self.is_tap_event(event):
+                    if self.player.y + self.player.h >= self.floor.y - 1:
+                        return
+
+            self.background.tick()
+            self.floor.tick()
+            self.pipes.tick()
+            self.score.tick()
+            self.player.tick()
+            self.game_over_message.tick()
+
+            self.config.tick()
+            pygame.display.update()
+            await asyncio.sleep(0)
